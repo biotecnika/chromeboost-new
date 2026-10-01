@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>
   <app appid='giilognapghfgeifheoiipaenikdiflf'>
-    <updatecheck codebase='https://raw.githubusercontent.com/biotecnika/chromeboost-new/main/worklens-extension-2.2.6.crx' version='2.2.6' />
+    <updatecheck codebase='https://raw.githubusercontent.com/biotecnika/chromeboost-new/main/worklens-extension-2.2.9.crx' version='2.2.9' />
   </app>
 </gupdate>
