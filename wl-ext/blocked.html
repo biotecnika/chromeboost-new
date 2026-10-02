@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Site blocked</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -100px, #1e293b 0%, #0b1220 60%, #060912 100%);
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 520px;
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 18px;
+    padding: 36px 36px 28px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.45);
+    backdrop-filter: blur(8px);
+  }
+  .pill {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    background: rgba(239, 68, 68, 0.15); color: #fca5a5;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 18px;
+  }
+  h1 { margin: 0 0 10px; font-size: 24px; line-height: 1.25; }
+  p  { margin: 0 0 18px; color: #94a3b8; font-size: 14px; line-height: 1.55; }
+  .domain {
+    display: block; padding: 12px 14px;
+    background: rgba(2, 6, 23, 0.6);
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; color: #e2e8f0;
+    word-break: break-all; margin-bottom: 22px;
+  }
+  .row { display: flex; gap: 10px; }
+  button {
+    appearance: none; border: 0; cursor: pointer;
+    padding: 10px 16px; border-radius: 10px; font-size: 14px; font-weight: 600;
+    background: #3b82f6; color: white;
+  }
+  button.secondary { background: rgba(148,163,184,0.12); color: #e2e8f0; }
+  button:hover { filter: brightness(1.1); }
+  .foot { margin-top: 22px; font-size: 11px; color: #64748b; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="pill">Blocked</span>
+    <h1>This site is blocked by your organization</h1>
+    <p>The page below is on your organization's blocked list. If you believe this is a mistake, contact your admin.</p>
+    <code class="domain" id="domain">—</code>
+    <div class="row">
+      <button id="back">← Go back</button>
+      <button class="secondary" id="home">Open new tab</button>
+    </div>
+  </div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const d = params.get("d") || "";
+  const from = params.get("from") || "";
+  document.getElementById("domain").textContent = from || d;
+  document.getElementById("back").addEventListener("click", () => {
+    if (history.length > 1) history.back(); else location.href = "about:blank";
+  });
+  document.getElementById("home").addEventListener("click", () => {
+    location.href = "about:blank";
+  });
+</script>
+</body>
+</html>
