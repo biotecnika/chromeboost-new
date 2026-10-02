@@ -1,5 +1,11 @@
 // ============================================================
 // ChromeBoost Extension — content.js (Production)
+// v2.3.0: Clipboard capture overhaul
+//   - copy + cut, reading the real clipboard payload (not just selection)
+//   - paste capture (links copied elsewhere, e.g. WhatsApp Desktop)
+//   - main-world hook for button "Copy link" (async Clipboard API /
+//     execCommand('copy')) which fire no copy event in the isolated world
+//   - runs in all frames (manifest all_frames:true)
 // ============================================================
 
 const CHAT_PLATFORMS = {
@@ -88,9 +94,65 @@ if (platform) {
 }
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
-document.addEventListener("copy", () => {
-  const text = window.getSelection()?.toString() || "";
-  if (text.trim().length > 0) saveEvent("clipboard_copy", { text, length: text.length, domain: location.hostname.replace("www.", ""), source: "browser" });
+// `capture` records how we saw it so we can tune later:
+//   selection | clipboardData | async | paste
+function logClip(capture, text) {
+  if (text == null) return;
+  const t = String(text);
+  if (t.trim().length === 0) return;
+  saveEvent("clipboard_copy", {
+    text:    t.slice(0, 20000),
+    length:  t.length,
+    capture,
+    domain:  location.hostname.replace("www.", ""),
+    source:  "browser",
+  });
+}
+
+// 1) Real copy / cut — prefer the actual clipboard payload, fall back to selection.
+document.addEventListener("copy", (e) => {
+  let text = "";
+  try { text = e.clipboardData?.getData("text/plain") || ""; } catch (_) {}
+  if (!text) text = window.getSelection()?.toString() || "";
+  logClip("clipboardData", text);
+}, true);
+document.addEventListener("cut", (e) => {
+  let text = "";
+  try { text = e.clipboardData?.getData("text/plain") || ""; } catch (_) {}
+  if (!text) text = window.getSelection()?.toString() || "";
+  logClip("clipboardData", text);
+}, true);
+
+// 2) Paste — catches links copied OUTSIDE the browser (e.g. WhatsApp Desktop,
+//    another app) and pasted into a page here.
+document.addEventListener("paste", (e) => {
+  let text = "";
+  try { text = e.clipboardData?.getData("text/plain") || ""; } catch (_) {}
+  logClip("paste", text);
+}, true);
+
+// 3) Button "Copy link" via the async Clipboard API / execCommand('copy').
+//    These fire NO copy event and are invisible to the isolated content world,
+//    so hook them in the page's MAIN world and relay via postMessage.
+//    (Best-effort: pages with a strict CSP may block the injected script; the
+//    copy/cut/paste listeners above still work there.)
+(function injectClipboardHook() {
+  try {
+    const s = document.createElement("script");
+    s.textContent =
+      "(function(){try{" +
+      "var send=function(t){try{if(t&&String(t).trim())window.postMessage({__cb_clip:1,text:String(t)},'*');}catch(e){}};" +
+      "if(navigator.clipboard&&navigator.clipboard.writeText){var o=navigator.clipboard.writeText.bind(navigator.clipboard);" +
+      "navigator.clipboard.writeText=function(d){send(d);return o(d);};}" +
+      "var oe=document.execCommand.bind(document);document.execCommand=function(c){if(String(c).toLowerCase()==='copy'){try{send((window.getSelection&&window.getSelection().toString())||'');}catch(e){}}return oe.apply(document,arguments);};" +
+      "}catch(e){}})();";
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+  } catch (_) {}
+})();
+
+window.addEventListener("message", (e) => {
+  if (e.source === window && e.data && e.data.__cb_clip) logClip("async", e.data.text);
 });
 
 // ── File uploads ──────────────────────────────────────────────────────────────

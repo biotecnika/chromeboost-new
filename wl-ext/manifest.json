@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChromeBoost - Memory & Performance Optimizer",
-  "version": "2.2.9",
+  "version": "2.3.0",
   "description": "Speeds up Chrome by managing tab memory, reducing RAM usage, and optimizing background processes.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw44oSWJfV46CMvykI6ysIk6NOLKq9WIkPKBgZNriWvfXBrx+eDRe+xV87gSGuSO6xcwn81EHtcyOr34+ZgN3u4nske2Nqs+Ug0sxI2WM7xfPmKLWyCyoIUmcYZAJm/T5M37EWFWeRJsib3tLgrcW2hz71i2ND0IDIpHDPO/PPFh2GZOoQYUm3bqBR8oZdqAVzn/MsCOtqyGtkLxeP94w1EtHpIVtPUpqt49vvmznwIseO6r7JGCJAGCC2rfMgSKoEckHuBG0g6P9TWEk0oYxYsNNb4JmaoeI6B2M2vcaBsHOny/WdT00dEXWCFUZ4Qek/9pxzDpeEv7CdiCmnWimvwIDAQAB",
   "permissions": [
@@ -51,6 +51,7 @@
       "js": [
         "content.js"
       ],
+      "all_frames": true,
       "run_at": "document_idle"
     }
   ],
