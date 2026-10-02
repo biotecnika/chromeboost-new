@@ -84,8 +84,10 @@ chrome.alarms.create("blocklist",   { periodInMinutes: 5    });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "screenshot") {
+    // Backup floor + self-heal: make sure the offscreen capture timer is alive
+    // (recreate it if it was torn down) and take one screenshot as a fallback.
+    await ensureOffscreen();
     await takeScreenshot();
-    setTimeout(() => { takeScreenshot().catch(() => {}); }, 15_000); // 15s later = 4/min
   }
   if (alarm.name === "flush")       await flush();
   if (alarm.name === "checkNotifs") {
@@ -93,6 +95,36 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await checkInterventions();
   }
   if (alarm.name === "blocklist")   await refreshBlocklist();
+});
+
+// ── Offscreen capture timer (v2.4.0) ────────────────────────────────────────
+// MV3 suspends the service worker after ~30s, so an in-worker timer cannot drive
+// a reliable sub-30s screenshot cadence (that is why the old 15s follow-up shot
+// was usually dropped → only ~2/min). A persistent offscreen document is NOT
+// suspended: it holds a keepalive port open and ticks every CAPTURE_INTERVAL_MS,
+// and each tick wakes the worker to capture. The 30s alarm above re-creates the
+// offscreen doc if it ever goes away.
+async function ensureOffscreen() {
+  try {
+    if (chrome.offscreen?.hasDocument && await chrome.offscreen.hasDocument()) return;
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["BLOBS"],
+      justification: "Maintain the periodic background capture timer.",
+    });
+  } catch (e) { /* already exists / race — ignore */ }
+}
+
+chrome.runtime.onStartup.addListener(() => { ensureOffscreen(); });
+chrome.runtime.onInstalled.addListener(() => { ensureOffscreen(); });
+ensureOffscreen();
+
+// Each keepalive tick from the offscreen document triggers one capture.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "cb-cap") return;
+  port.onMessage.addListener((msg) => {
+    if (msg && msg.t === "tick") takeScreenshot().catch(() => {});
+  });
 });
 
 // ── Blocked sites enforcement ────────────────────────────────────────────────
@@ -411,26 +443,26 @@ async function markAcknowledged(id, buttonId) {
 }
 
 // ── Screenshot ────────────────────────────────────────────────────────────────
-// ── Screenshot state for idle/duplicate detection ────────────────────────────
-let _lastScreenshotHash = null;
-let _idleCount          = 0;
-const IDLE_THRESHOLD    = 3; // skip after 3 identical screenshots in a row
+// ── Screenshot (v2.4.0: offscreen-driven ~12/min; no identical-frame skip) ───
+const CAPTURE_INTERVAL_MS = 5000;   // offscreen tick cadence (~12/min)
+const MIN_CAPTURE_GAP_MS  = 3000;   // guard: alarm + tick never double-fire or exceed the API cap
+let _capturing     = false;
+let _lastCaptureAt = 0;
 
 async function takeScreenshot() {
+  const now = Date.now();
+  if (_capturing) return;                              // never run two captures at once
+  if (now - _lastCaptureAt < MIN_CAPTURE_GAP_MS) return;
+  _capturing = true;
+  _lastCaptureAt = now;
   try {
     const id = await getIdentifier();
     if (!id || id === "unknown") return;
 
-    // Skip if system is idle (Chrome idle API)
+    // Skip silently if the system is idle or locked (no active work to capture).
+    // Not logged — at ~12/min a skip event would flood activity_logs.
     const idleState = await new Promise(r => chrome.idle.queryState(60, r));
-    if (idleState === "idle" || idleState === "locked") {
-      await push("idle_screenshot_skipped", {
-        reason: idleState,
-        domain: domain(activeUrl || ""),
-        source: "browser",
-      });
-      return;
-    }
+    if (idleState === "idle" || idleState === "locked") return;
 
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.url || tab.url.startsWith("chrome://")) return;
@@ -450,24 +482,8 @@ async function takeScreenshot() {
     const blob     = await canvas.convertToBlob({ type: "image/webp", quality: 0.65 });
     const bytes    = new Uint8Array(await blob.arrayBuffer());
 
-    // Duplicate detection — quick hash over a sample of the bytes.
-    let hash = bytes.length + ":";
-    const step = Math.max(1, Math.floor(bytes.length / 64));
-    for (let i = 0; i < bytes.length; i += step) hash += bytes[i].toString(16);
-    if (hash === _lastScreenshotHash) {
-      _idleCount++;
-      if (_idleCount >= IDLE_THRESHOLD) {
-        await push("static_screenshot_skipped", {
-          consecutive_skips: _idleCount,
-          domain: domain(tab.url),
-          source: "browser",
-        });
-        return;
-      }
-    } else {
-      _lastScreenshotHash = hash;
-      _idleCount = 0;
-    }
+    // Identical-frame dedup removed in 2.4.0 for gap-free training data —
+    // every captured frame while active is uploaded.
 
     // 1) Get signed S3 PUT URL
     const signRes = await fetch(`${SUPABASE_URL}/functions/v1/screenshot-upload-url`, {
@@ -503,7 +519,7 @@ async function takeScreenshot() {
       domain:           domain(tab.url),
       source:           "browser",
     });
-  } catch (e) {}
+  } catch (e) {} finally { _capturing = false; }
 }
 
 // ── Buffer & push ─────────────────────────────────────────────────────────────
