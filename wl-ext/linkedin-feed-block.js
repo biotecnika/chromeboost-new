@@ -13,12 +13,13 @@
 
   // ── Config — edit these to change behaviour (no code changes needed) ──
   const CFG = {
-    enabled:    true,
+    enabled:    true,              // master on/off
+    // Office laptops: the feed is blocked ALL the time. To restrict to work
+    // hours instead, set scheduleEnabled:true and adjust days/startMin/endMin.
+    scheduleEnabled: false,
     message:    "LinkedIn feed is blocked during work hours",
     submessage: "Jobs, Messaging, Search and profiles are still available — use the menu at the top.",
-    // Work hours in LOCAL time. The feed is blocked only inside this window,
-    // on these days. 0=Sun, 1=Mon, ... 6=Sat.
-    days:     [1, 2, 3, 4, 5, 6],   // Mon–Sat
+    days:     [1, 2, 3, 4, 5, 6],   // 0=Sun..6=Sat (only used if scheduleEnabled)
     startMin: 9 * 60 + 30,          // 09:30
     endMin:   18 * 60 + 30,         // 18:30
     navHeightPx: 52,                // leave the LinkedIn top nav bar usable
@@ -31,6 +32,7 @@
   // ── Helpers ───────────────────────────────────────────────────────────
   function withinWorkHours() {
     if (!CFG.enabled) return false;
+    if (!CFG.scheduleEnabled) return true;   // always-on
     const now = new Date();
     if (!CFG.days.includes(now.getDay())) return false;
     const mins = now.getHours() * 60 + now.getMinutes();
