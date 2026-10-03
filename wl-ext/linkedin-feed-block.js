@@ -39,11 +39,16 @@
     return mins >= CFG.startMin && mins < CFG.endMin;
   }
 
-  // The home feed ("river") is the bare root or /feed — NOT /feed/update/<post>,
-  // and NOT /jobs, /messaging, /in/<profile>, /search, /notifications, etc.
+  // The home feed ("river") is the bare root, /feed, and its tabs
+  // (/feed/foryou, /feed/following, …). We still ALLOW individual post
+  // permalinks (/feed/update/<post>) and leave /jobs, /messaging, /in/<profile>,
+  // /search, /notifications, etc. untouched.
   function isFeedRoute() {
     const p = location.pathname.replace(/\/+$/, "");   // drop trailing slashes
-    return p === "" || p === "/feed";
+    if (p === "" || p === "/feed") return true;
+    if (p.startsWith("/feed/update/")) return false;   // a single post — allow
+    if (p.startsWith("/feed/")) return true;           // feed tabs — block
+    return false;
   }
 
   let _logged = false;
