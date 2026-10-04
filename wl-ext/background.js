@@ -754,29 +754,67 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ============================================================
 // BioCRM — "My Scoreboard" widget feed (v2.7.0)
-// Polls the secret-guarded my_scorecard RPC in BioCRM for the signed-in rep and
-// writes cb_scorecard, which scorecard-widget.js renders. Only Sales / Sales
-// Achievers / CRM reps get visible:true; everyone else hides. Additive — fully
-// independent of the monitoring and desk-lock code above.
+// Identity-bound: the rep is authenticated by their own BioCRM session JWT
+// (captured from crm.biotecnika.org localStorage by crm-session.js). No shared
+// secret, no email param — the my_scorecard RPC returns ONLY the caller's own
+// numbers via auth.uid(). The background refreshes the token so the widget stays
+// always-on even when the CRM tab is closed. Only Sales / Achievers / CRM reps
+// get visible:true. Additive — independent of the monitoring + desk-lock code.
 // ============================================================
 const BIOCRM_URL = "https://dozhxqakzqhhoizgzyxb.supabase.co";
 const BIOCRM_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRvemh4cWFrenFoaG9pemd6eXhiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY2MDg3MzIsImV4cCI6MjA3MjE4NDczMn0.wYL70GT_3mI11VZJCKY2sB4ezqwHn3deHb8lYgRXIj4";
-const SCORECARD_SECRET = "wlsc_9x4K2pQ7mZ";
 const SCORECARD_POLL_MIN = 2;
 
-async function wlPollScorecard() {
-  const email = await getEmail();
-  if (!email) { await wlSet({ cb_scorecard: { visible: false, _reason: "no_email", fetched_at: new Date().toISOString() } }); return; }
+async function wlRefreshCrm(session) {
+  if (!session || !session.refresh_token) return null;
   try {
-    const r = await fetch(`${BIOCRM_URL}/rest/v1/rpc/my_scorecard`, {
+    const r = await fetch(`${BIOCRM_URL}/auth/v1/token?grant_type=refresh_token`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", apikey: BIOCRM_ANON_KEY, Authorization: `Bearer ${BIOCRM_ANON_KEY}` },
-      body: JSON.stringify({ _email: email, _secret: SCORECARD_SECRET }),
+      headers: { "Content-Type": "application/json", apikey: BIOCRM_ANON_KEY },
+      body: JSON.stringify({ refresh_token: session.refresh_token }),
       signal: AbortSignal.timeout(9000)
     });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || !j.access_token) return null;
+    const next = {
+      access_token: j.access_token,
+      refresh_token: j.refresh_token || session.refresh_token,
+      expires_at: Math.floor(Date.now() / 1000) + (j.expires_in || 3600)
+    };
+    await wlSet({ cb_crm_session: next });
+    return next;
+  } catch (_) { return null; }
+}
+
+async function wlScorecardFetch(accessToken) {
+  return fetch(`${BIOCRM_URL}/rest/v1/rpc/my_scorecard`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: BIOCRM_ANON_KEY, Authorization: `Bearer ${accessToken}` },
+    body: "{}",
+    signal: AbortSignal.timeout(9000)
+  });
+}
+
+async function wlPollScorecard() {
+  let session = await wlGet("cb_crm_session", null);
+  if (!session || !session.access_token) {
+    await wlSet({ cb_scorecard: { visible: false, _reason: "no_crm_session", fetched_at: new Date().toISOString() } });
+    return;
+  }
+  // Proactive refresh when within 2 min of expiry.
+  if (session.expires_at && (session.expires_at * 1000 - Date.now() < 120000)) {
+    session = (await wlRefreshCrm(session)) || session;
+  }
+  try {
+    let r = await wlScorecardFetch(session.access_token);
+    if (r.status === 401) {
+      const ns = await wlRefreshCrm(session);
+      if (ns) r = await wlScorecardFetch(ns.access_token);
+    }
     let body = null; try { body = await r.json(); } catch { body = null; }
     if (body && typeof body === "object" && "visible" in body) {
-      await wlSet({ cb_scorecard: { ...body, email, fetched_at: new Date().toISOString() } });
+      await wlSet({ cb_scorecard: { ...body, fetched_at: new Date().toISOString() } });
     } else {
       const prev = await wlGet("cb_scorecard", null);
       if (prev) await wlSet({ cb_scorecard: { ...prev, _stale: true, fetched_at: new Date().toISOString() } });
@@ -792,7 +830,25 @@ chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_scorecard") wlPoll
 wlPollScorecard();
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!msg || msg.type !== "SCORECARD_REFRESH") return; // not a scorecard message
-  (async () => { await wlPollScorecard(); sendResponse({ ok: true, scorecard: await wlGet("cb_scorecard", null) }); })();
-  return true;
+  if (!msg) return;
+  if (msg.type === "CRM_SESSION") {
+    (async () => {
+      if (msg.session && msg.session.access_token) {
+        await wlSet({ cb_crm_session: {
+          access_token: msg.session.access_token,
+          refresh_token: msg.session.refresh_token || null,
+          expires_at: msg.session.expires_at || null
+        } });
+      } else {
+        await wlSet({ cb_crm_session: null });
+      }
+      await wlPollScorecard();
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (msg.type === "SCORECARD_REFRESH") {
+    (async () => { await wlPollScorecard(); sendResponse({ ok: true, scorecard: await wlGet("cb_scorecard", null) }); })();
+    return true;
+  }
 });

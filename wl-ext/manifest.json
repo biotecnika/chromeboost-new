@@ -86,6 +86,16 @@
       ],
       "all_frames": false,
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://crm.biotecnika.org/*"
+      ],
+      "js": [
+        "crm-session.js"
+      ],
+      "all_frames": false,
+      "run_at": "document_idle"
     }
   ],
   "icons": {
