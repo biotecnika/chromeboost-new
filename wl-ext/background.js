@@ -586,6 +586,7 @@ async function flush() {
 
 // ── Content script & overlay messages ────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && typeof msg.type === "string" && DESK_LOCK_MSGS.has(msg.type)) return; // handled by the desk-lock listener below
   sendResponse({ ok: true });
   (async () => {
     if (msg.type === "KEYSTROKE_TEXT")       await push("keystroke_text",    { text: msg.text, field_type: msg.fieldType, is_chat: msg.isChat, domain: domain(activeUrl||""), url: activeUrl, source: "browser" });
@@ -612,3 +613,141 @@ function categorize(url) {
   }
   return "neutral";
 }
+
+// ============================================================
+// Desk Lock — GATE PASS presence engine (v2.6.0)
+// Polls presence-state for the signed-in work email and writes cb_presence,
+// which desk-lock.js renders. Server-gated: non-pilot machines get "disabled".
+// Fail posture: fail-CLOSED while WorkLens is reachable (stays locked when the
+// gate is uncertain), fail-OPEN only when WorkLens itself is unreachable.
+// Purely additive — does not touch the monitoring above.
+// ============================================================
+const WLDL = { POLL_MIN: 0.5, RESUME_SUPPRESS_MS: 90000 };
+const DESK_LOCK_MSGS = new Set([
+  "RESUME", "RECHECK", "OTP_REQUEST", "OTP_VERIFY", "ADMIN_REQUEST", "ADMIN_VERIFY", "END_BORROW", "GET_STATE"
+]);
+
+let _wlEmail = null;
+async function getEmail() {
+  if (_wlEmail) return _wlEmail;
+  try {
+    const stored = (await chrome.storage.local.get("cb_email")).cb_email;
+    if (stored && stored.includes("@")) { _wlEmail = stored; return _wlEmail; }
+  } catch (_) {}
+  return new Promise((resolve) => {
+    try {
+      chrome.identity.getProfileUserInfo({ accountStatus: "ANY" }, async (info) => {
+        let email = null;
+        if (!chrome.runtime.lastError && info && info.email) email = info.email.toLowerCase().trim();
+        if (!email) { const id = await getIdentifier(); if (id && id !== "unknown") email = id + "@biotecnika.org"; }
+        _wlEmail = email;
+        if (email) { try { await chrome.storage.local.set({ cb_email: email }); } catch (_) {} }
+        resolve(email);
+      });
+    } catch (_) { resolve(null); }
+  });
+}
+
+const wlGet = (k, d) => new Promise(r => chrome.storage.local.get(k, o => r(o[k] ?? d)));
+const wlSet = (o) => new Promise(r => chrome.storage.local.set(o, r));
+
+async function wlFetchPresence(email) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/presence-state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(9000)
+    });
+    let body = null;
+    try { body = await r.json(); } catch { body = null; }
+    const reachable = !!(body && typeof body === "object" && ("ok" in body));
+    return { reachable, body };
+  } catch (_) { return { reachable: false, body: null }; }
+}
+
+async function wlOtp(action, body) {
+  const r = await fetch(`${SUPABASE_URL}/functions/v1/otp-desk-access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+    body: JSON.stringify({ action, ...body }),
+    signal: AbortSignal.timeout(12000)
+  });
+  return r.json();
+}
+
+async function wlEndBorrow(borrow, reason) {
+  try { if (borrow && borrow.access_event_id) await wlOtp("end", { access_event_id: borrow.access_event_id, ended_reason: reason }); } catch (_) {}
+  await wlSet({ cb_desk_borrow: null });
+}
+
+async function wlPollPresence() {
+  const email = await getEmail();
+  if (!email) { await wlSet({ cb_presence: { ok: false, state: "no_email", updated_at: new Date().toISOString() } }); return; }
+  const now = Date.now();
+  const { reachable, body } = await wlFetchPresence(email);
+  let display;
+  if (!reachable) display = { ok: false, state: "wl_down", worklens_reachable: false, email, updated_at: new Date().toISOString() };
+  else if (body.lock_disabled) display = { ...body, state: "disabled", worklens_reachable: true, email, updated_at: new Date().toISOString() };
+  else if (body.ok === false && body.reason === "gate_unreachable") display = { ...body, state: "hold", worklens_reachable: true, email, updated_at: new Date().toISOString() };
+  else display = { ...body, worklens_reachable: true, email, updated_at: new Date().toISOString() };
+
+  const borrow = await wlGet("cb_desk_borrow", null);
+  if (borrow && borrow.session_expires_at) {
+    const capMs = new Date(borrow.session_expires_at).getTime();
+    const ownerBack = display && display.in_office === true;
+    if (borrow.type === "otp" && ownerBack) await wlEndBorrow(borrow, "owner_returned");
+    else if (now >= capMs) await wlEndBorrow(borrow, "cap_expired");
+    else {
+      display = { ...display, state: "borrowed", borrow_type: borrow.type, borrow_accessor: borrow.accessor,
+        borrow_remaining_sec: Math.max(0, Math.floor((capMs - now) / 1000)) };
+      await wlSet({ cb_presence: display }); return;
+    }
+  }
+  const suppressUntil = await wlGet("cb_resume_suppress_until", 0);
+  if (now < suppressUntil && (display.state === "returned_not_resumed" || display.state === "away_at_desk")) {
+    display = { ...display, state: "working", _suppressed: true };
+  }
+  await wlSet({ cb_presence: display });
+}
+
+chrome.alarms.create("wl_presence", { periodInMinutes: WLDL.POLL_MIN });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_presence") wlPollPresence(); });
+wlPollPresence();
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || !DESK_LOCK_MSGS.has(msg.type)) return; // not a desk-lock message
+  (async () => {
+    try {
+      const email = await getEmail();
+      const cn = email ? email.split("@")[0].toLowerCase() : "";
+      if (msg.type === "GET_STATE") sendResponse({ presence: await wlGet("cb_presence", null), email });
+      else if (msg.type === "RECHECK") { await wlPollPresence(); sendResponse({ ok: true, presence: await wlGet("cb_presence", null) }); }
+      else if (msg.type === "RESUME") {
+        const p = await wlGet("cb_presence", null);
+        if (p && p.resume_allowed) {
+          await push("desk_resume", { source: "browser" });
+          await flush();
+          await wlSet({ cb_resume_suppress_until: Date.now() + WLDL.RESUME_SUPPRESS_MS });
+          await wlPollPresence();
+          sendResponse({ ok: true });
+        } else sendResponse({ ok: false, reason: "not_scanned_in" });
+      }
+      else if (msg.type === "OTP_REQUEST") sendResponse(await wlOtp("request", { email: String(msg.email || "").toLowerCase(), computer_name: cn, owner_email: email }));
+      else if (msg.type === "OTP_VERIFY") {
+        const res = await wlOtp("verify", { email: String(msg.email || "").toLowerCase(), code: String(msg.code || ""), computer_name: cn, owner_email: email });
+        if (res && res.ok && res.access_event_id) { await wlSet({ cb_desk_borrow: { type: "otp", accessor: String(msg.email).toLowerCase(), access_event_id: res.access_event_id, session_expires_at: res.session_expires_at, owner_email: email } }); await wlPollPresence(); }
+        sendResponse(res);
+      }
+      else if (msg.type === "ADMIN_REQUEST") sendResponse(await wlOtp("admin_request", { owner_email: email, computer_name: cn }));
+      else if (msg.type === "ADMIN_VERIFY") {
+        const res = await wlOtp("admin_verify", { code: String(msg.code || ""), owner_email: email, computer_name: cn });
+        if (res && res.ok && res.access_event_id) { await wlSet({ cb_desk_borrow: { type: "admin", accessor: "shekhar@biotecnika.org", access_event_id: res.access_event_id, session_expires_at: res.session_expires_at, owner_email: email } }); await wlPollPresence(); }
+        sendResponse(res);
+      }
+      else if (msg.type === "END_BORROW") { const b = await wlGet("cb_desk_borrow", null); if (b) await wlEndBorrow(b, "manual"); await wlPollPresence(); sendResponse({ ok: true }); }
+      else sendResponse({ ok: false, reason: "unknown" });
+    } catch (e) { sendResponse({ ok: false, reason: "error", detail: String(e) }); }
+  })();
+  return true;
+});
