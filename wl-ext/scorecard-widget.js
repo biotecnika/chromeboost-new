@@ -56,10 +56,14 @@
       #${ID} .wlsc-ft button{background:transparent;border:none;color:#5e6b8c;cursor:pointer;font-size:11px;}
       #${ID} .wlsc-ft button:hover{color:#8aa0cf;}
       #${ID}.min{width:auto;}
-      #${ID}.min .wlsc-body{display:none;}
-      #${ID}.min .wlsc-hd{border-bottom:none;}
-      #${ID}.min .wlsc-pill{display:flex;}
-      #${ID} .wlsc-pill{display:none;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#cfe0ff;padding-right:4px;}`;
+      #${ID} .wlsc-mini{display:flex;align-items:center;gap:7px;padding:6px 10px;cursor:grab;}
+      #${ID} .wlsc-mini:active{cursor:grabbing;}
+      #${ID} .wlsc-mdot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 7px #22c55e;flex:none;}
+      #${ID} .wlsc-mdot.stale{background:#f59e0b;box-shadow:0 0 7px #f59e0b;}
+      #${ID} .wlsc-mnums{font-size:12.5px;font-weight:800;color:#eaf1ff;font-variant-numeric:tabular-nums;letter-spacing:.02em;white-space:nowrap;}
+      #${ID} .wlsc-mnums .s{color:#5e6b8c;font-weight:600;margin:0 1px;}
+      #${ID} .wlsc-mexp{background:transparent;border:none;color:#7f90b5;cursor:pointer;font-size:12px;line-height:1;padding:0 1px;}
+      #${ID} .wlsc-mexp:hover{color:#eaf1ff;}`;
     (document.head || document.documentElement).appendChild(st);
   }
 
@@ -93,12 +97,19 @@
             : "")
       : `<div class="wlsc-row" style="color:#7f90b5;">No wins logged yet today — go get one \u{1F3AF}</div>`;
 
-    el.innerHTML = `
+    if (ui.min) {
+      el.innerHTML = `
+        <div class="wlsc-mini" id="${ID}_hd">
+          <span class="wlsc-mdot ${stale ? "stale" : ""}"></span>
+          <span class="wlsc-mnums">${c.total || 0}<span class="s">·</span>${c.connected || 0}<span class="s">·</span>${mmss(c.avg_talk)}<span class="s">·</span>${dur(c.talk_seconds)}</span>
+          <button class="wlsc-mexp" id="${ID}_tog" title="Expand">▢</button>
+        </div>`;
+    } else {
+      el.innerHTML = `
       <div class="wlsc-hd" id="${ID}_hd">
         <span class="wlsc-ttl"><span class="wlsc-dot ${stale ? "stale" : ""}"></span>\u{1F3CF} My Scoreboard</span>
-        <span class="wlsc-pill">${c.total || 0} calls · ${c.connected || 0} conn</span>
         <span class="wlsc-team">${esc(TEAM[d.team] || d.team || "")}</span>
-        <button class="wlsc-btn" id="${ID}_tog" title="${ui.min ? "Expand" : "Minimize"}">${ui.min ? "▢" : "–"}</button>
+        <button class="wlsc-btn" id="${ID}_tog" title="Minimize">–</button>
       </div>
       <div class="wlsc-body">
         <div class="wlsc-name">${esc(d.display_name || "")}</div>
@@ -117,6 +128,7 @@
           <button id="${ID}_rf">Refresh</button>
         </div>
       </div>`;
+    }
 
     place(el);
     wireDrag(el, document.getElementById(ID + "_hd"));
