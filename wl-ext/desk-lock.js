@@ -25,6 +25,13 @@
   let _rendered = null;
   let clockTimer = null;
 
+  // Away-from-desk (idle) screen is served from a hosted page so its design can change
+  // server-side with no extension release. All other lock states still render inline below.
+  const IFRAME_ORIGIN = "https://gatepass.biotecnika.org";
+  const IFRAME_URL = IFRAME_ORIGIN + "/pause.html";
+  let _awayPayload = null;
+  let _iframeMsgBound = false;
+
   function ensureStyle() {
     if (document.getElementById(OV + "_s")) return;
     const st = document.createElement("style");
@@ -87,11 +94,70 @@
     _rendered = "borrowed";
   }
 
+  // Build the state payload the hosted away-screen needs.
+  function awayStatePayload(p) {
+    const payload = { type: "WL_LOCK_STATE" };
+    const t = p && p.last_activity_ts ? Date.parse(p.last_activity_ts) : NaN;
+    if (!isNaN(t)) payload.awaySince = t;
+    else if (p && typeof p.idle_seconds === "number") payload.idleSeconds = p.idle_seconds;
+    const comp = (p && Array.isArray(p.computer_names) && p.computer_names.length)
+      ? p.computer_names[0] : ((p && p.computer_name) || "");
+    if (comp) payload.computer = comp;
+    return payload;
+  }
+
+  function bindIframeMessages() {
+    if (_iframeMsgBound) return;
+    _iframeMsgBound = true;
+    window.addEventListener("message", (ev) => {
+      if (ev.origin !== IFRAME_ORIGIN) return;
+      const d = ev.data || {};
+      if (d.type === "WL_LOCK_READY") {
+        const fr = document.getElementById(OV + "_frame");
+        if (fr && fr.contentWindow && _awayPayload) {
+          try { fr.contentWindow.postMessage(_awayPayload, IFRAME_ORIGIN); } catch (_) {}
+        }
+      } else if (d.type === "WL_LOCK_ACTION" && d.action === "resume") {
+        send({ type: "RESUME" }).then((r) => { if (r && r.ok) removeOverlay(); });
+      }
+    });
+  }
+
+  // Away-from-desk: full-screen iframe to the hosted page; state relayed via postMessage.
+  function buildAwayIframe(p) {
+    const bn = document.getElementById(OV + "_banner"); if (bn) bn.remove();
+    _awayPayload = awayStatePayload(p);
+    let ov = document.getElementById(OV);
+    if (!ov || !document.getElementById(OV + "_frame")) {
+      if (ov) ov.remove();
+      ov = document.createElement("div");
+      ov.id = OV;
+      ov.setAttribute("style", "position:fixed!important;inset:0!important;z-index:2147483646!important;background:#0b1020!important;margin:0!important;padding:0!important;border:0!important;");
+      const f = document.createElement("iframe");
+      f.id = OV + "_frame";
+      f.setAttribute("allow", "fullscreen");
+      f.setAttribute("style", "position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;border:0!important;margin:0!important;display:block!important;");
+      f.src = IFRAME_URL;
+      ov.appendChild(f);
+      (document.body || document.documentElement).appendChild(ov);
+    } else {
+      // Already showing: just push the freshest state in.
+      const fr = document.getElementById(OV + "_frame");
+      if (fr && fr.contentWindow) { try { fr.contentWindow.postMessage(_awayPayload, IFRAME_ORIGIN); } catch (_) {} }
+    }
+    bindIframeMessages();
+    if (!mo) {
+      mo = new MutationObserver(() => { if (!document.getElementById(OV)) evaluate(); });
+      try { mo.observe(document.documentElement, { childList: true, subtree: true }); } catch (_) {}
+    }
+  }
+
   function buildLock(p) {
     const c = COPY[p.state] || COPY.out;
     ensureStyle();
     const bn = document.getElementById(OV + "_banner"); if (bn) bn.remove();
     let ov = document.getElementById(OV);
+    if (ov && document.getElementById(OV + "_frame")) { ov.remove(); ov = null; } // was the away iframe — rebuild clean
     if (!ov) { ov = document.createElement("div"); ov.id = OV; (document.body || document.documentElement).appendChild(ov); }
     ov.innerHTML = `
       <div class="wl-card">
@@ -226,7 +292,7 @@
     if (p.state === "borrowed") { showBorrow(p); return; }
     if (LOCKED.includes(p.state)) {
       if (_rendered === p.state && document.getElementById(OV)) return; // keep OTP/admin input intact
-      buildLock(p);
+      if (p.state === "away_at_desk") buildAwayIframe(p); else buildLock(p);
       _rendered = p.state;
     } else {
       removeOverlay(); // working / disabled / wl_down / out_of_scope / no_*_record
