@@ -30,6 +30,7 @@
   const IFRAME_ORIGIN = "https://gatepass.biotecnika.org";
   const IFRAME_URL = IFRAME_ORIGIN + "/pause.html";
   let _awayPayload = null;
+  let _frameReady = false, _frameFailUntil = 0, _frameTimer = null; // offline fallback for the hosted away screen
   let _iframeMsgBound = false;
 
   function ensureStyle() {
@@ -113,6 +114,7 @@
       if (ev.origin !== IFRAME_ORIGIN) return;
       const d = ev.data || {};
       if (d.type === "WL_LOCK_READY") {
+        _frameReady = true; if (_frameTimer) { clearTimeout(_frameTimer); _frameTimer = null; }
         const fr = document.getElementById(OV + "_frame");
         if (fr && fr.contentWindow && _awayPayload) {
           try { fr.contentWindow.postMessage(_awayPayload, IFRAME_ORIGIN); } catch (_) {}
@@ -140,6 +142,17 @@
       f.src = IFRAME_URL;
       ov.appendChild(f);
       (document.body || document.documentElement).appendChild(ov);
+      // If the hosted page doesn't answer within 8s (host down / blocked / offline), fall back to
+      // the built-in lock for 5 minutes so the user never faces a blank, un-dismissable screen.
+      _frameReady = false;
+      if (_frameTimer) clearTimeout(_frameTimer);
+      _frameTimer = setTimeout(() => {
+        _frameTimer = null;
+        if (_frameReady || !document.getElementById(OV + "_frame")) return;
+        _frameFailUntil = Date.now() + 5 * 60 * 1000;
+        removeOverlay();
+        evaluate();
+      }, 8000);
     } else {
       // Already showing: just push the freshest state in.
       const fr = document.getElementById(OV + "_frame");
@@ -292,7 +305,7 @@
     if (p.state === "borrowed") { showBorrow(p); return; }
     if (LOCKED.includes(p.state)) {
       if (_rendered === p.state && document.getElementById(OV)) return; // keep OTP/admin input intact
-      if (p.state === "away_at_desk") buildAwayIframe(p); else buildLock(p);
+      if (p.state === "away_at_desk" && Date.now() >= _frameFailUntil) buildAwayIframe(p); else buildLock(p);
       _rendered = p.state;
     } else {
       removeOverlay(); // working / disabled / wl_down / out_of_scope / no_*_record
