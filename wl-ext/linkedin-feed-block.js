@@ -113,9 +113,25 @@
     _logged = false;
   }
 
+  // Team-based exemption: background.js stores cb_linkedin_access
+  // ({allowed, team, checked_at}) from the linkedin-access edge function.
+  // Only an explicit allowed:true opens the feed; missing/false => blocked.
+  // A cached "allowed" older than 24h is ignored (fail-closed).
+  let _allowed = false;
+  const ALLOW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  function applyAccess(v) {
+    _allowed = !!(v && v.allowed === true && v.checked_at && (Date.now() - v.checked_at) < ALLOW_MAX_AGE_MS);
+  }
+  try {
+    chrome.storage.local.get("cb_linkedin_access", (o) => { applyAccess(o && o.cb_linkedin_access); evaluate(); });
+    chrome.storage.onChanged.addListener((ch, area) => {
+      if (area === "local" && ch.cb_linkedin_access) { applyAccess(ch.cb_linkedin_access.newValue); evaluate(); }
+    });
+  } catch (_) {}
+
   function evaluate() {
     try {
-      if (isFeedRoute() && withinWorkHours()) showBlock();
+      if (isFeedRoute() && withinWorkHours() && !_allowed) showBlock();
       else hideBlock();
     } catch (_) {}
   }

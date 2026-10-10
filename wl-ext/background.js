@@ -711,6 +711,28 @@ async function wlPollPresence() {
   await wlSet({ cb_presence: display });
 }
 
+// ── LinkedIn feed access (v2.8.1) ──────────────────────────────────────
+// Server decides (team-based, from CrewCharm roster in WorkLens). Result is
+// cached in storage for linkedin-feed-block.js. Any failure => keep last
+// known value; no value ever stored => feed stays blocked (fail-closed).
+async function wlPollLinkedin() {
+  try {
+    const email = await getEmail();
+    if (!email) return;
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/linkedin-access`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(9000)
+    });
+    const b = await r.json();
+    if (b && b.ok === true) await wlSet({ cb_linkedin_access: { allowed: b.allowed === true, team: b.team || null, checked_at: Date.now() } });
+  } catch (_) {}
+}
+chrome.alarms.create("wl_linkedin", { periodInMinutes: 5 });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_linkedin") wlPollLinkedin(); });
+wlPollLinkedin();
+
 chrome.alarms.create("wl_presence", { periodInMinutes: WLDL.POLL_MIN });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_presence") wlPollPresence(); });
 wlPollPresence();
