@@ -733,6 +733,63 @@ chrome.alarms.create("wl_linkedin", { periodInMinutes: 5 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_linkedin") wlPollLinkedin(); });
 wlPollLinkedin();
 
+// ── Meeting detection (v2.9.0) ───────────────────────────────────────────────
+// A video call looks exactly like "idle" to keyboard/mouse detection. We report
+// "in a meeting" when a known meeting tab is open AND it is playing (or recently
+// played) audio. Only the platform name is sent - never the tab URL/title/people.
+//   Meet:  meeting-room URL (abc-defg-hij) + audio   | Zoom web client + audio
+//   Teams/Webex/Whereby/Slack huddle tabs: audio is the signal.
+const WLMT = {
+  POLL_MIN: 0.5,                 // 30 s (MV3 alarm floor)
+  AUDIO_GRACE_MS: 10 * 60 * 1000, // quiet stretch inside a call still counts
+  PLATFORMS: [
+    { p: "meet",  re: /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:[/?#]|$)/i, needRoom: true },
+    { p: "zoom",  re: /^https:\/\/[\w.-]*zoom\.us\/(?:wc\/|j\/|myhome)/i },
+    { p: "teams", re: /^https:\/\/teams\.(?:microsoft|live)\.com\//i },
+    { p: "webex", re: /^https:\/\/[\w.-]*webex\.com\/(?:meet|wbxmjs|webappng)/i },
+    { p: "whereby", re: /^https:\/\/whereby\.com\//i },
+    { p: "slack", re: /^https:\/\/app\.slack\.com\/huddle/i },
+  ],
+};
+function wlMeetingPlatform(url) {
+  for (const x of WLMT.PLATFORMS) if (x.re.test(url || "")) return x;
+  return null;
+}
+chrome.tabs.onUpdated.addListener((tabId, ch, tab) => {
+  if (ch.audible === true && wlMeetingPlatform(tab && tab.url)) {
+    wlGet("cb_meet_audio", {}).then(m => { m[tabId] = Date.now(); wlSet({ cb_meet_audio: m }); });
+  }
+});
+let _wlInMeeting = false;
+async function wlCheckMeeting() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const audio = await wlGet("cb_meet_audio", {});
+    const now = Date.now();
+    let hit = null;
+    for (const t of tabs) {
+      const pl = wlMeetingPlatform(t.url);
+      if (!pl) continue;
+      if (t.audible) { audio[t.id] = now; }
+      const recentAudio = audio[t.id] && (now - audio[t.id]) < WLMT.AUDIO_GRACE_MS;
+      if (recentAudio) { hit = pl.p; break; }
+    }
+    // forget tabs that no longer exist
+    const live = new Set(tabs.map(t => String(t.id)));
+    for (const k of Object.keys(audio)) if (!live.has(k)) delete audio[k];
+    await wlSet({ cb_meet_audio: audio });
+    if (hit) {
+      await push("meeting_state", { in_meeting: true, platform: hit });
+      _wlInMeeting = true;
+    } else if (_wlInMeeting) {
+      await push("meeting_state", { in_meeting: false });
+      _wlInMeeting = false;
+    }
+  } catch (_) {}
+}
+chrome.alarms.create("wl_meeting", { periodInMinutes: WLMT.POLL_MIN });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_meeting") wlCheckMeeting(); });
+
 chrome.alarms.create("wl_presence", { periodInMinutes: WLDL.POLL_MIN });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_presence") wlPollPresence(); });
 wlPollPresence();
