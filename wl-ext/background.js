@@ -733,6 +733,96 @@ chrome.alarms.create("wl_linkedin", { periodInMinutes: 5 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_linkedin") wlPollLinkedin(); });
 wlPollLinkedin();
 
+// ── Spreadsheet DLP (v2.10.0) ────────────────────────────────────────────────
+// Server decides exemption (team/user, from CrewCharm roster) + the global
+// enforce kill switch (observe-first rollout). Cached in storage for both this
+// file's download interception and content.js's upload interception.
+// Fail-closed: no cached value, or any poll failure, => treated as not exempt
+// (restricted). `enforce` defaults to false (don't block) until a successful
+// poll says otherwise — a brand-new feature should never block on a guess.
+const DLP_BLOCKED_EXT = new Set(["csv", "xls", "xlsx", "xlsm"]);
+
+function dlpBasename(pathOrUrl) {
+  try {
+    const u = new URL(pathOrUrl, "https://x/");
+    const last = decodeURIComponent(u.pathname.split("/").pop() || "");
+    if (last) return last;
+  } catch (_) {}
+  return String(pathOrUrl || "").split(/[\\/]/).pop() || "download";
+}
+function dlpExtOf(name) {
+  const m = /\.([a-z0-9]+)$/i.exec(String(name || "").trim());
+  return m ? m[1].toLowerCase() : "";
+}
+
+async function wlPollDlp() {
+  try {
+    const email = await getEmail();
+    if (!email) return;
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/dlp-access`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(9000)
+    });
+    const b = await r.json();
+    if (b && b.ok === true) {
+      await wlSet({ cb_dlp_access: { exempt: b.exempt === true, enforce: b.enforce === true, team: b.team || null, checked_at: Date.now() } });
+    }
+  } catch (_) { /* keep last known cached value; fail-closed default lives at the read site */ }
+}
+chrome.alarms.create("wl_dlp", { periodInMinutes: 5 });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "wl_dlp") wlPollDlp(); });
+wlPollDlp();
+
+function injectDlpBlockOverlay(filename) {
+  if (document.getElementById("__cb_dlp_overlay")) return;
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+  const overlay = document.createElement("div");
+  overlay.id = "__cb_dlp_overlay";
+  overlay.style.cssText = `position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;background:rgba(0,0,0,0.8)!important;z-index:2147483647!important;display:flex!important;align-items:center!important;justify-content:center!important;font-family:'Segoe UI',system-ui,sans-serif!important;`;
+  overlay.innerHTML = `
+    <div style="background:#1a1f2e;border:2px solid #ef4444;border-radius:16px;padding:36px 40px;max-width:440px;width:90%;text-align:center;box-shadow:0 25px 60px rgba(0,0,0,0.8);">
+      <div style="width:60px;height:60px;background:#7f1d1d;border:2px solid #ef4444;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:26px;">🚫</div>
+      <span style="background:#ef4444;color:#fff;font-size:10px;font-weight:700;text-transform:uppercase;padding:3px 12px;border-radius:20px;display:inline-block;margin-bottom:14px;">Download Blocked</span>
+      <h2 style="color:#f0f6fc;font-size:19px;font-weight:700;margin:0 0 10px;">Spreadsheet download restricted</h2>
+      <p style="color:#9aa3be;font-size:13px;line-height:1.6;margin:0 0 8px;">${esc(filename)} wasn't downloaded. CSV/Excel file downloads are restricted by company policy.</p>
+      <p style="color:#6b7280;font-size:12px;line-height:1.5;margin:0 0 22px;">Contact IT if you need an exception.</p>
+      <button id="__cb_dlp_btn" style="background:#ef4444;color:#fff;border:none;padding:11px 28px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;width:100%;">Dismiss</button>
+    </div>`;
+  document.body.appendChild(overlay);
+  document.getElementById("__cb_dlp_btn").addEventListener("click", () => overlay.remove());
+  setTimeout(() => { try { overlay.remove(); } catch (_) {} }, 10000);
+}
+
+chrome.downloads.onCreated.addListener(async (item) => {
+  try {
+    const name = item.filename ? dlpBasename(item.filename) : dlpBasename(item.url || "");
+    const ext = dlpExtOf(name) || dlpExtOf(item.url || "");
+    if (!DLP_BLOCKED_EXT.has(ext)) return;
+    const dlp = await wlGet("cb_dlp_access", { exempt: false, enforce: false, team: null });
+    const d = domain(item.finalUrl || item.url || item.referrer || "");
+    const willBlock = dlp.enforce === true && dlp.exempt !== true;
+    if (willBlock) {
+      try { await chrome.downloads.cancel(item.id); } catch (_) {}
+      try { await chrome.downloads.erase({ id: item.id }); } catch (_) {}
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id && isInjectableUrl(tab.url)) {
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: injectDlpBlockOverlay, args: [name] });
+        }
+      } catch (_) {}
+    }
+    await push("spreadsheet_blocked", {
+      direction: "download", filename: name, ext, domain: d,
+      blocked: willBlock, would_block: dlp.exempt !== true, team: dlp.team || null,
+    });
+    if (willBlock) await flush();
+  } catch (_) {}
+});
+
 // ── Meeting detection (v2.9.0) ───────────────────────────────────────────────
 // A video call looks exactly like "idle" to keyboard/mouse detection. We report
 // "in a meeting" when a known meeting tab is open AND it is playing (or recently

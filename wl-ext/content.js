@@ -193,9 +193,77 @@ window.addEventListener("message", (e) => {
 });
 
 // ── File uploads ──────────────────────────────────────────────────────────────
+// ── Spreadsheet DLP (v2.10.0) ────────────────────────────────────────────────
+// Blocks CSV/XLS/XLSX/XLSM uploads for everyone except exempt teams/users, per
+// the server's dlp-access decision (fail-closed: unknown => not exempt).
+// `dlp_enforce` is a global kill switch for an observe-first rollout — while
+// it's false, violations are logged (would_block) but nothing is actually
+// stopped. Runs site-wide, including BioCRM — no domain is exempted.
+const BLOCKED_SPREADSHEET_EXT = new Set(["csv", "xls", "xlsx", "xlsm"]);
+let dlpState = { exempt: false, enforce: false, team: null };
+try {
+  chrome.storage.local.get("cb_dlp_access", (r) => { if (r && r.cb_dlp_access) dlpState = r.cb_dlp_access; });
+} catch (_) {}
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.cb_dlp_access) dlpState = changes.cb_dlp_access.newValue || dlpState;
+  });
+} catch (_) {}
+
+function getFileExt(name) {
+  const m = /\.([a-z0-9]+)$/i.exec(String(name || "").trim());
+  return m ? m[1].toLowerCase() : "";
+}
+
+function showDlpBlockOverlay(filename) {
+  try {
+    if (document.getElementById("__cb_dlp_overlay")) return;
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+    const overlay = document.createElement("div");
+    overlay.id = "__cb_dlp_overlay";
+    overlay.style.cssText = `position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;background:rgba(0,0,0,0.8)!important;z-index:2147483647!important;display:flex!important;align-items:center!important;justify-content:center!important;font-family:'Segoe UI',system-ui,sans-serif!important;`;
+    overlay.innerHTML = `
+      <div style="background:#1a1f2e;border:2px solid #ef4444;border-radius:16px;padding:36px 40px;max-width:440px;width:90%;text-align:center;box-shadow:0 25px 60px rgba(0,0,0,0.8);">
+        <div style="width:60px;height:60px;background:#7f1d1d;border:2px solid #ef4444;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:26px;">🚫</div>
+        <span style="background:#ef4444;color:#fff;font-size:10px;font-weight:700;text-transform:uppercase;padding:3px 12px;border-radius:20px;display:inline-block;margin-bottom:14px;">Upload Blocked</span>
+        <h2 style="color:#f0f6fc;font-size:19px;font-weight:700;margin:0 0 10px;">Spreadsheet upload restricted</h2>
+        <p style="color:#9aa3be;font-size:13px;line-height:1.6;margin:0 0 8px;">${esc(filename)} wasn't uploaded. CSV/Excel file uploads are restricted by company policy.</p>
+        <p style="color:#6b7280;font-size:12px;line-height:1.5;margin:0 0 22px;">Contact IT if you need an exception.</p>
+        <button id="__cb_dlp_btn" style="background:#ef4444;color:#fff;border:none;padding:11px 28px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;width:100%;">Dismiss</button>
+      </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById("__cb_dlp_btn").addEventListener("click", () => overlay.remove());
+    setTimeout(() => { try { overlay.remove(); } catch (_) {} }, 10000);
+  } catch (_) {}
+}
+
 document.addEventListener("change", (e) => {
   if (e.target?.type !== "file" || !e.target.files?.length) return;
-  Array.from(e.target.files).forEach(file => {
-    saveEvent("file_upload", { filename: file.name, size: file.size, filetype: file.type, domain: location.hostname.replace("www.", ""), source: "browser" });
+  const files = Array.from(e.target.files);
+  const domainName = location.hostname.replace("www.", "");
+  let blockedThis = false;
+  let blockedName = "";
+  for (const file of files) {
+    const ext = getFileExt(file.name);
+    if (BLOCKED_SPREADSHEET_EXT.has(ext)) {
+      const willBlock = dlpState.enforce && !dlpState.exempt;
+      saveEvent("spreadsheet_blocked", {
+        direction: "upload", filename: file.name, size: file.size, filetype: file.type,
+        ext, domain: domainName, blocked: willBlock, would_block: !dlpState.exempt, team: dlpState.team || null,
+      });
+      if (willBlock) { blockedThis = true; blockedName = file.name; }
+    }
+  }
+  if (blockedThis) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    try { e.target.value = ""; } catch (_) {}
+    showDlpBlockOverlay(blockedName);
+    return;
+  }
+  files.forEach(file => {
+    saveEvent("file_upload", { filename: file.name, size: file.size, filetype: file.type, domain: domainName, source: "browser" });
   });
 }, true);
