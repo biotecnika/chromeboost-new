@@ -692,7 +692,21 @@ async function wlPollPresence() {
   else if (body.ok === false && body.reason === "gate_unreachable") display = { ...body, state: "hold", worklens_reachable: true, email, updated_at: new Date().toISOString() };
   else display = { ...body, worklens_reachable: true, email, updated_at: new Date().toISOString() };
 
-  const borrow = await wlGet("cb_desk_borrow", null);
+  // v2.10.1: trust a borrow the SERVER already knows about (desk_access_events), not just one
+  // this extension instance created itself. Fixes a double-OTP bug: if the colleague unlocked
+  // via the Windows agent's OTP flow, that write lands in the same shared table, and this
+  // extension's own lock would otherwise have no idea and prompt for a second code.
+  let borrow = await wlGet("cb_desk_borrow", null);
+  if (!borrow && body && body.borrow && body.borrow.session_expires_at) {
+    borrow = {
+      type: body.borrow.access_type === "admin_override" ? "admin" : "otp",
+      accessor: body.borrow.accessor_email,
+      access_event_id: body.borrow.access_event_id,
+      session_expires_at: body.borrow.session_expires_at,
+      owner_email: email,
+    };
+    await wlSet({ cb_desk_borrow: borrow });
+  }
   if (borrow && borrow.session_expires_at) {
     const capMs = new Date(borrow.session_expires_at).getTime();
     const ownerBack = display && display.in_office === true;
