@@ -59,13 +59,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 async function handleTabChange(tab) {
-  if (!tab.url || tab.url.startsWith("chrome://")) return;
+  // Always close out the prior session first, even when the tab we're
+  // switching TO is a chrome:// / new-tab page (v2.10.2 fix — this used to
+  // return before closing the old session, so time kept accruing to
+  // whatever site was active before the new tab, instead of stopping there).
   if (activeUrl && sessionStart) {
     const dur = Math.round((Date.now() - sessionStart) / 1000);
     if (dur > 2) await push("website_visit", {
       url: activeUrl, title: activeTitle, duration_seconds: dur,
       domain: domain(activeUrl), category: categorize(activeUrl)
     });
+  }
+  if (!tab.url || tab.url.startsWith("chrome://")) {
+    // No session for chrome:// pages themselves (can't be captured anyway);
+    // just leave nothing active so the next real site starts a fresh clock.
+    activeUrl = null; activeTitle = null; sessionStart = null;
+    return;
   }
   activeUrl = tab.url; activeTitle = tab.title; sessionStart = Date.now();
 }
