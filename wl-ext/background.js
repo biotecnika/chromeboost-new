@@ -124,9 +124,10 @@ async function ensureOffscreen() {
   } catch (e) { /* already exists / race — ignore */ }
 }
 
-chrome.runtime.onStartup.addListener(() => { ensureOffscreen(); });
-chrome.runtime.onInstalled.addListener(() => { ensureOffscreen(); });
+chrome.runtime.onStartup.addListener(() => { ensureOffscreen(); refillSlots(); });
+chrome.runtime.onInstalled.addListener(() => { ensureOffscreen(); refillSlots(); });
 ensureOffscreen();
+refillSlots();
 
 // Each keepalive tick from the offscreen document triggers one capture.
 chrome.runtime.onConnect.addListener((port) => {
@@ -458,6 +459,98 @@ const MIN_CAPTURE_GAP_MS  = 3000;   // guard: alarm + tick never double-fire or 
 let _capturing     = false;
 let _lastCaptureAt = 0;
 
+// ── Pre-signed screenshot-slot queue (v2.11.0) ─────────────────────────────
+// screenshot-upload-url now accepts {count, interval_ms} and signs a batch of
+// S3 PUT URLs in one call. We keep a small rolling queue of these so most
+// captures spend a pre-fetched slot instead of round-tripping the signing
+// call every 5s — that's what collapses ~12 edge-function invocations/min
+// down to roughly one every two minutes. A capture NEVER waits on a refill:
+// if no slot fits, it falls straight back to the old single-URL call, and a
+// refill is only ever kicked off in the background, un-awaited.
+const SLOT_BATCH_COUNT   = 24;                        // ~2 min of slots per refill (24 * 5s)
+const SLOT_REFILL_FLOOR  = 6;                         // refill once fewer than this remain
+const SLOT_FIT_WINDOW_MS = CAPTURE_INTERVAL_MS / 2;   // how far a slot's time may drift from "now"
+
+let _slotQueue          = []; // [{upload_url, method, key, slot_at}], kept sorted by slot_at
+let _slotRefillInFlight = false;
+
+function pruneSlots() {
+  const cutoff = Date.now() - SLOT_FIT_WINDOW_MS;
+  _slotQueue = _slotQueue.filter((s) => s.slot_at >= cutoff);
+}
+
+async function refillSlots() {
+  if (_slotRefillInFlight) return;
+  _slotRefillInFlight = true;
+  try {
+    const id = await getIdentifier();
+    if (!id || id === "unknown") return;
+    const signRes = await fetch(`${SUPABASE_URL}/functions/v1/screenshot-upload-url`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        computer_name: id, ext: "webp",
+        count: SLOT_BATCH_COUNT, interval_ms: CAPTURE_INTERVAL_MS,
+      }),
+    });
+    if (!signRes.ok) return;
+    const data = await signRes.json();
+    const uploads = Array.isArray(data.uploads) ? data.uploads : [];
+    if (!uploads.length) return;
+    pruneSlots();
+    const existingKeys = new Set(_slotQueue.map((s) => s.key));
+    for (const u of uploads) {
+      if (!u?.upload_url || !u?.key || existingKeys.has(u.key)) continue;
+      _slotQueue.push({ upload_url: u.upload_url, method: u.method || "PUT", key: u.key, slot_at: u.slot_at });
+    }
+    _slotQueue.sort((a, b) => a.slot_at - b.slot_at);
+  } catch (e) {
+    // swallow — a failed refill just means the next captures fall back
+    // to single-URL signing until the floor check tries again.
+  } finally {
+    _slotRefillInFlight = false;
+  }
+}
+
+// Returns the queued slot whose slot_at is closest to now, as long as it's
+// within SLOT_FIT_WINDOW_MS; otherwise null, so the caller falls back.
+function takeSlot() {
+  pruneSlots();
+  if (!_slotQueue.length) return null;
+  const now = Date.now();
+  let bestIdx = -1, bestDiff = Infinity;
+  for (let i = 0; i < _slotQueue.length; i++) {
+    const diff = Math.abs(_slotQueue[i].slot_at - now);
+    if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+  }
+  if (bestIdx === -1 || bestDiff > SLOT_FIT_WINDOW_MS) return null;
+  const slot = _slotQueue[bestIdx];
+  _slotQueue.splice(bestIdx, 1);
+  return slot;
+}
+
+async function getSingleSignedUrl(id, ext) {
+  try {
+    const signRes = await fetch(`${SUPABASE_URL}/functions/v1/screenshot-upload-url`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ computer_name: id, ext }),
+    });
+    if (!signRes.ok) return null;
+    const data = await signRes.json();
+    if (!data?.upload_url || !data?.key) return null;
+    return { upload_url: data.upload_url, method: data.method || "PUT", key: data.key, bucket: data.bucket };
+  } catch (e) { return null; }
+}
+
 async function takeScreenshot() {
   const now = Date.now();
   if (_capturing) return;                              // never run two captures at once
@@ -494,32 +587,42 @@ async function takeScreenshot() {
     // Identical-frame dedup removed in 2.4.0 for gap-free training data —
     // every captured frame while active is uploaded.
 
-    // 1) Get signed S3 PUT URL
-    const signRes = await fetch(`${SUPABASE_URL}/functions/v1/screenshot-upload-url`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
-      },
-      body: JSON.stringify({ computer_name: id, ext: "webp" }),
-    });
-    if (!signRes.ok) return;
-    const { upload_url, key, bucket } = await signRes.json();
-    if (!upload_url || !key) return;
+    // 1) Get an upload slot — spend a pre-signed one if one fits "now"
+    // (v2.11.0), otherwise fall back to the original single-URL call.
+    // Never waits on a refill.
+    let slot = takeSlot();
+    let bucket = S3_BUCKET;
+    if (!slot) {
+      slot = await getSingleSignedUrl(id, "webp");
+      if (!slot) return;
+    }
+    if (slot.bucket) bucket = slot.bucket;
 
-    // 2) Upload to S3
-    const putRes = await fetch(upload_url, {
-      method: "PUT",
+    // 2) Upload to S3 — if the PUT fails (e.g. a stale/expired slot), get
+    // one fresh single URL and retry exactly once.
+    let putRes = await fetch(slot.upload_url, {
+      method: slot.method || "PUT",
       headers: { "Content-Type": "image/webp" },
       body: blob,
     });
-    if (!putRes.ok) return;
+    let finalKey = slot.key;
+    if (!putRes.ok) {
+      const retry = await getSingleSignedUrl(id, "webp");
+      if (!retry) return;
+      putRes = await fetch(retry.upload_url, {
+        method: retry.method || "PUT",
+        headers: { "Content-Type": "image/webp" },
+        body: blob,
+      });
+      if (!putRes.ok) return;
+      finalKey = retry.key;
+      if (retry.bucket) bucket = retry.bucket;
+    }
 
     // 3) Record metadata
     await push("screenshot", {
-      s3_key:           key,
-      bucket:           bucket || S3_BUCKET,
+      s3_key:           finalKey,
+      bucket:           bucket,
       storage_provider: "s3",
       size:             bytes.length,
       format:           "webp",
@@ -528,6 +631,10 @@ async function takeScreenshot() {
       domain:           domain(tab.url),
       source:           "browser",
     });
+
+    // Background refill, never awaited — a slow/failed refill must not
+    // delay this or any future capture.
+    if (_slotQueue.length < SLOT_REFILL_FLOOR) refillSlots();
   } catch (e) {} finally { _capturing = false; }
 }
 
